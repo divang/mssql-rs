@@ -37,11 +37,19 @@ fn epa_enabled() -> bool {
     env::var("EPA_TEST").is_ok()
 }
 
+fn test_data_source() -> String {
+    env::var("EPA_TEST_DATASOURCE").unwrap_or_else(|_| "tcp:localhost,1433".to_string())
+}
+
+fn test_database() -> String {
+    env::var("EPA_TEST_DATABASE").unwrap_or_else(|_| "master".to_string())
+}
+
 /// Integrated-auth context over a Mandatory-encrypted connection (the path that
 /// triggers `tls-unique` extraction on the Windows Schannel-direct engine).
 fn integrated_encrypted_context() -> ClientContext {
     let mut context = ClientContext::default();
-    context.database = "master".to_string();
+    context.database = test_database();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
     context.encryption_options = EncryptionOptions {
         mode: EncryptionSetting::On,
@@ -70,7 +78,7 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
 
     let provider = TdsConnectionProvider {};
     let mut connection = provider
-        .create_client(integrated_encrypted_context(), "tcp:localhost,1433", None)
+        .create_client(integrated_encrypted_context(), &test_data_source(), None)
         .await
         .expect(
             "integrated-auth encrypted login should succeed; under EPA=Required this also \
@@ -113,4 +121,39 @@ async fn epa_channel_binding_login_succeeds() -> TdsResult<()> {
     );
     connection.close_query().await?;
     Ok(())
+}
+
+/// A binding with one application-data byte altered must be rejected when SQL
+/// Server Extended Protection is Required. This is a controlled negative test:
+/// it uses the current process identity and never captures or forwards another
+/// connection's authentication tokens.
+#[tokio::test]
+async fn epa_mismatched_channel_binding_is_rejected() -> TdsResult<()> {
+    if !epa_enabled() || env::var_os("EPA_EXPECT_CBT_REJECTION").is_none() {
+        println!("Skipping EPA rejection test - set EPA_TEST=1 and EPA_EXPECT_CBT_REJECTION=1");
+        return Ok(());
+    }
+    common::init_tracing();
+
+    // SAFETY: Rust 2024 marks process-environment mutation unsafe because it
+    // races with other threads. This integration test is run as a single test
+    // process, and the variable is set before the provider creates any tasks.
+    unsafe { env::set_var("MSSQL_TDS_TEST_CORRUPT_CBT", "1") };
+
+    let provider = TdsConnectionProvider {};
+    let result = provider
+        .create_client(integrated_encrypted_context(), &test_data_source(), None)
+        .await;
+
+    unsafe { env::remove_var("MSSQL_TDS_TEST_CORRUPT_CBT") };
+
+    match result {
+        Ok(_) => panic!(
+            "SQL Server accepted a deliberately mismatched CBT; ensure Extended Protection is Required"
+        ),
+        Err(error) => {
+            println!("EXPECTED SQL CBT REJECTION: {error}");
+            Ok(())
+        }
+    }
 }

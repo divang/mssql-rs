@@ -647,6 +647,24 @@ impl LoginHandler<'_> {
             // (Windows Schannel-direct today); plaintext or engines without
             // support return `None`, leaving channel bindings unset.
             if let Some(token) = reader_writer.channel_binding_token() {
+                #[cfg(feature = "test-util")]
+                let token = {
+                    let mut token = token;
+                    if std::env::var_os("MSSQL_TDS_TEST_CORRUPT_CBT").is_some() {
+                        // Test-only fault injection: retain Schannel's complete
+                        // SEC_CHANNEL_BINDINGS layout but alter one byte in its
+                        // application-data region. SQL Server therefore receives
+                        // a structurally valid binding that cannot match this TLS
+                        // channel. Never enabled in normal production builds.
+                        if let Some(last) = token.last_mut() {
+                            *last ^= 0x01;
+                        }
+                        debug!(
+                            "TEST ONLY: altered TLS channel binding token to exercise EPA rejection"
+                        );
+                    }
+                    token
+                };
                 debug!(
                     "Applying TLS channel binding token ({} bytes) for Extended Protection",
                     token.len()

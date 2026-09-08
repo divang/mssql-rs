@@ -11,22 +11,35 @@ use crate::protocol::{
     ENCRYPT_ON, ENCRYPT_REQ, LoginRelayOutcome, PACKET_HEADER_SIZE, PacketHeader, ProtocolError,
     build_client_prelogin, parse_prelogin_encryption,
 };
+use crate::tds_tls_wrapper::TdsTlsWrapper;
 use bytes::BytesMut;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_native_tls::TlsStream;
 use tracing::{debug, info, warn};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One TDS session to the upstream SQL Server used only for NTLM handshake.
 pub struct NtlmRelaySession {
-    stream: TcpStream,
+    stream: RelayStream,
     sql_server: String,
+    trust_server_certificate: bool,
+}
+
+enum RelayStream {
+    Plain(TcpStream),
+    Tls(TlsStream<TdsTlsWrapper>),
+    Transitioning,
 }
 
 impl NtlmRelaySession {
-    pub async fn connect(sql_server: &str) -> Result<Self, ProtocolError> {
+    pub async fn connect(
+        sql_server: &str,
+        trust_server_certificate: bool,
+    ) -> Result<Self, ProtocolError> {
         info!(sql_server, "Connecting NTLM relay to upstream SQL Server");
         let stream = tokio::time::timeout(UPSTREAM_TIMEOUT, TcpStream::connect(sql_server))
             .await
@@ -44,8 +57,9 @@ impl NtlmRelaySession {
             })?;
 
         let mut session = Self {
-            stream,
+            stream: RelayStream::Plain(stream),
             sql_server: sql_server.to_string(),
+            trust_server_certificate,
         };
         session.prelogin().await?;
         Ok(session)
@@ -61,18 +75,51 @@ impl NtlmRelaySession {
         let response = self.read_message().await?;
         let encryption = parse_prelogin_encryption(&response)?;
         if encryption == ENCRYPT_ON || encryption == ENCRYPT_REQ {
-            return Err(ProtocolError::Protocol(format!(
-                "Upstream SQL Server at {} requires TLS (PreLogin ENCRYPTION={encryption}). \
-                 The NTLM relay currently speaks unencrypted TDS to SQL Server; \
-                 disable Force Encryption on that instance.",
-                self.sql_server
-            )));
+            self.enable_tls().await?;
         }
         debug!(
             sql_server = %self.sql_server,
             encryption,
             "Upstream PreLogin completed without TLS"
         );
+        Ok(())
+    }
+
+    async fn enable_tls(&mut self) -> Result<(), ProtocolError> {
+        let RelayStream::Plain(stream) =
+            std::mem::replace(&mut self.stream, RelayStream::Transitioning)
+        else {
+            return Ok(());
+        };
+
+        let mut builder = native_tls::TlsConnector::builder();
+        if self.trust_server_certificate {
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        let connector = builder.build().map_err(|error| {
+            ProtocolError::Protocol(format!("TLS configuration failed: {error}"))
+        })?;
+        let domain = upstream_host(&self.sql_server);
+        let (wrapper, handshake_complete) = TdsTlsWrapper::new_client(stream);
+        let tls = tokio::time::timeout(
+            UPSTREAM_TIMEOUT,
+            tokio_native_tls::TlsConnector::from(connector).connect(domain, wrapper),
+        )
+        .await
+        .map_err(|_| {
+            ProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Timed out negotiating TLS with SQL Server at {}",
+                    self.sql_server
+                ),
+            ))
+        })?
+        .map_err(|error| ProtocolError::Protocol(format!("Upstream TLS failed: {error}")))?;
+        handshake_complete.store(true, Ordering::Release);
+        self.stream = RelayStream::Tls(tls);
+        info!(sql_server = %self.sql_server, "Upstream TLS negotiation completed");
         Ok(())
     }
 
@@ -83,7 +130,16 @@ impl NtlmRelaySession {
     }
 
     async fn write_all(&mut self, packet: &[u8]) -> Result<(), ProtocolError> {
-        tokio::time::timeout(UPSTREAM_TIMEOUT, self.stream.write_all(packet))
+        let write = async {
+            match &mut self.stream {
+                RelayStream::Plain(stream) => stream.write_all(packet).await,
+                RelayStream::Tls(stream) => stream.write_all(packet).await,
+                RelayStream::Transitioning => Err(std::io::Error::other(
+                    "relay stream is transitioning to TLS",
+                )),
+            }
+        };
+        tokio::time::timeout(UPSTREAM_TIMEOUT, write)
             .await
             .map_err(|_| {
                 ProtocolError::Io(std::io::Error::new(
@@ -99,7 +155,15 @@ impl NtlmRelaySession {
             let mut out = BytesMut::new();
             loop {
                 let mut header_buf = [0u8; PACKET_HEADER_SIZE];
-                self.stream.read_exact(&mut header_buf).await?;
+                match &mut self.stream {
+                    RelayStream::Plain(stream) => stream.read_exact(&mut header_buf).await?,
+                    RelayStream::Tls(stream) => stream.read_exact(&mut header_buf).await?,
+                    RelayStream::Transitioning => {
+                        return Err(ProtocolError::Protocol(
+                            "relay stream is transitioning to TLS".to_string(),
+                        ));
+                    }
+                };
                 let mut header_bytes: &[u8] = &header_buf;
                 let header = PacketHeader::parse(&mut header_bytes)?;
                 if (header.length as usize) < PACKET_HEADER_SIZE {
@@ -108,7 +172,15 @@ impl NtlmRelaySession {
                 let remaining = header.length as usize - PACKET_HEADER_SIZE;
                 let mut body = vec![0u8; remaining];
                 if remaining > 0 {
-                    self.stream.read_exact(&mut body).await?;
+                    match &mut self.stream {
+                        RelayStream::Plain(stream) => stream.read_exact(&mut body).await?,
+                        RelayStream::Tls(stream) => stream.read_exact(&mut body).await?,
+                        RelayStream::Transitioning => {
+                            return Err(ProtocolError::Protocol(
+                                "relay stream is transitioning to TLS".to_string(),
+                            ));
+                        }
+                    };
                 }
                 out.extend_from_slice(&header_buf);
                 out.extend_from_slice(&body);
@@ -128,6 +200,15 @@ impl NtlmRelaySession {
     }
 }
 
+fn upstream_host(sql_server: &str) -> &str {
+    if let Some(rest) = sql_server.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    sql_server
+        .rsplit_once(':')
+        .map_or(sql_server, |(host, _)| host)
+}
+
 /// Apply handshake-state updates after an upstream login response is received.
 pub fn apply_relay_outcome(
     outcome: LoginRelayOutcome,
@@ -140,7 +221,7 @@ pub fn apply_relay_outcome(
         }
         LoginRelayOutcome::Complete => {
             info!(sql_server, "SQL Server accepted the NTLM response");
-            (true, Some(format!("ntlm-relay:{sql_server}")), true)
+            (true, Some(format!("ntlm-relay:{sql_server}")), false)
         }
         LoginRelayOutcome::Failed => {
             warn!(sql_server, "SQL Server rejected NTLM authentication");
@@ -165,7 +246,7 @@ mod tests {
             apply_relay_outcome(LoginRelayOutcome::Complete, "sql:1433");
         assert!(authed);
         assert_eq!(identity.as_deref(), Some("ntlm-relay:sql:1433"));
-        assert!(drop_session);
+        assert!(!drop_session);
 
         let (authed, identity, drop_session) =
             apply_relay_outcome(LoginRelayOutcome::Failed, "sql:1433");
@@ -224,7 +305,7 @@ mod tests {
                 .expect("login ack");
         });
 
-        let mut relay = NtlmRelaySession::connect(&sql_addr.to_string())
+        let mut relay = NtlmRelaySession::connect(&sql_addr.to_string(), false)
             .await
             .expect("connect relay");
         let login7 = wrap_in_packet(PacketType::Login7, BytesMut::from(&b"type1"[..]));

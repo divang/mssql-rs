@@ -14,6 +14,8 @@
 use bytes::{Buf, BufMut, BytesMut};
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -25,6 +27,28 @@ const TDS_HEADER_SIZE: usize = 8;
 /// TDS packet types
 const TDS_PRELOGIN: u8 = 0x12;
 const TDS_TABULAR_RESULT: u8 = 0x04;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperRole {
+    Server,
+    Client,
+}
+
+impl WrapperRole {
+    fn incoming_packet_type(self) -> u8 {
+        match self {
+            Self::Server => TDS_PRELOGIN,
+            Self::Client => TDS_TABULAR_RESULT,
+        }
+    }
+
+    fn outgoing_packet_type(self) -> u8 {
+        match self {
+            Self::Server => TDS_TABULAR_RESULT,
+            Self::Client => TDS_PRELOGIN,
+        }
+    }
+}
 
 /// TLS record types (for detecting raw TLS records after handshake)
 const TLS_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -82,7 +106,9 @@ enum WrapperMode {
 /// pass-through mode where data flows directly without TDS wrapping.
 pub struct TdsTlsWrapper {
     inner: TcpStream,
+    role: WrapperRole,
     mode: WrapperMode,
+    handshake_complete: Arc<AtomicBool>,
     // Read state
     read_buffer: BytesMut,
     read_phase: ReadPhase,
@@ -99,9 +125,32 @@ pub struct TdsTlsWrapper {
 
 impl TdsTlsWrapper {
     pub fn new(stream: TcpStream) -> Self {
+        Self::new_with_role(
+            stream,
+            WrapperRole::Server,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Create the client-side wrapper used while initiating TLS to SQL Server.
+    pub(crate) fn new_client(stream: TcpStream) -> (Self, Arc<AtomicBool>) {
+        let handshake_complete = Arc::new(AtomicBool::new(false));
+        (
+            Self::new_with_role(stream, WrapperRole::Client, handshake_complete.clone()),
+            handshake_complete,
+        )
+    }
+
+    fn new_with_role(
+        stream: TcpStream,
+        role: WrapperRole,
+        handshake_complete: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner: stream,
+            role,
             mode: WrapperMode::Handshake,
+            handshake_complete,
             read_buffer: BytesMut::with_capacity(8192),
             read_phase: ReadPhase::DetectType,
             header_buf: [0u8; TDS_HEADER_SIZE],
@@ -128,6 +177,11 @@ impl AsyncRead for TdsTlsWrapper {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        if this.handshake_complete.load(Ordering::Acquire) {
+            this.mode = WrapperMode::PassThrough;
+            this.read_phase = ReadPhase::PassThrough;
+        }
 
         loop {
             match this.read_phase {
@@ -194,13 +248,17 @@ impl AsyncRead for TdsTlsWrapper {
                             this.header_buf[0] = first;
                             this.header_bytes_read = 1;
 
-                            if first == TDS_PRELOGIN {
-                                debug!("TdsTlsWrapper: detected TDS PreLogin packet");
+                            if first == this.role.incoming_packet_type() {
+                                debug!(
+                                    "TdsTlsWrapper: detected expected TDS TLS packet type 0x{:02x}",
+                                    first
+                                );
                                 this.read_phase = ReadPhase::ReadingTdsHeader;
                             } else {
                                 debug!(
-                                    "TdsTlsWrapper: unexpected TDS packet type 0x{:02x}, expected PreLogin (0x12)",
-                                    first
+                                    "TdsTlsWrapper: unexpected TDS packet type 0x{:02x}, expected 0x{:02x}",
+                                    first,
+                                    this.role.incoming_packet_type()
                                 );
                                 // Still try to read as TDS packet
                                 this.read_phase = ReadPhase::ReadingTdsHeader;
@@ -315,6 +373,10 @@ impl AsyncWrite for TdsTlsWrapper {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
+        if this.handshake_complete.load(Ordering::Acquire) {
+            this.mode = WrapperMode::PassThrough;
+        }
+
         // If in pass-through mode, write directly to inner stream
         if this.mode == WrapperMode::PassThrough {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -327,8 +389,9 @@ impl AsyncWrite for TdsTlsWrapper {
                     let packet_len = buf.len() + TDS_HEADER_SIZE;
                     this.write_buffer = BytesMut::with_capacity(packet_len);
 
-                    // TDS header (TabularResult type 0x04 for server responses)
-                    this.write_buffer.put_u8(TDS_TABULAR_RESULT);
+                    // Server responses use TabularResult; client handshake
+                    // records use PreLogin packets.
+                    this.write_buffer.put_u8(this.role.outgoing_packet_type());
                     this.write_buffer.put_u8(0x01); // status: EOM
                     this.write_buffer.put_u16(packet_len as u16); // length (big endian)
                     this.write_buffer.put_u16(0); // SPID

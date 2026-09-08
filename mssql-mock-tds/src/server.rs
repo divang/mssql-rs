@@ -49,7 +49,10 @@ pub enum AuthenticationMode {
     /// The mock still answers PreLogin (and TLS) itself. LOGIN7 and SSPI packets
     /// are sent to `sql_server` (`host:port`) so that SQL Server issues the
     /// challenge and accepts or rejects the client's response.
-    WindowsNtlmRelay { sql_server: String },
+    WindowsNtlmRelay {
+        sql_server: String,
+        trust_server_certificate: bool,
+    },
 }
 
 impl AuthenticationMode {
@@ -59,8 +62,18 @@ impl AuthenticationMode {
 
     fn ntlm_relay_sql(&self) -> Option<&str> {
         match self {
-            Self::WindowsNtlmRelay { sql_server } => Some(sql_server.as_str()),
+            Self::WindowsNtlmRelay { sql_server, .. } => Some(sql_server.as_str()),
             _ => None,
+        }
+    }
+
+    fn ntlm_relay_trust_server_certificate(&self) -> bool {
+        match self {
+            Self::WindowsNtlmRelay {
+                trust_server_certificate,
+                ..
+            } => *trust_server_certificate,
+            _ => false,
         }
     }
 }
@@ -284,7 +297,11 @@ impl ConnectionProcessor {
                 "NTLM relay authentication is already in progress",
             ));
         }
-        self.ntlm_relay = Some(NtlmRelaySession::connect(&sql_server).await?);
+        let trust_server_certificate = self
+            .authentication_mode
+            .ntlm_relay_trust_server_certificate();
+        self.ntlm_relay =
+            Some(NtlmRelaySession::connect(&sql_server, trust_server_certificate).await?);
         self.forward_ntlm_relay_packet(packet).await
     }
 
@@ -1837,6 +1854,7 @@ mod tests {
             None,
             AuthenticationMode::WindowsNtlmRelay {
                 sql_server: sql_addr.to_string(),
+                trust_server_certificate: false,
             },
         );
         let token = b"client-type1";
@@ -1880,7 +1898,7 @@ mod tests {
             processor.authenticated_identity.as_deref(),
             Some(format!("ntlm-relay:{sql_addr}").as_str())
         );
-        assert!(processor.ntlm_relay.is_none());
+        assert!(processor.ntlm_relay.is_some());
 
         sql_task.await.expect("fake SQL task");
     }

@@ -74,6 +74,14 @@ struct Args {
     #[arg(long, value_enum, default_value = "accept-all")]
     auth_mode: AuthMode,
 
+    /// Forward integrated-auth LOGIN7/SSPI messages to this SQL Server (host:port).
+    #[arg(long)]
+    ntlm_relay_sql: Option<String>,
+
+    /// Accept an untrusted or name-mismatched certificate from the relay target.
+    #[arg(long, requires = "ntlm_relay_sql")]
+    relay_trust_server_certificate: bool,
+
     /// Path to PEM certificate file (required for TLS modes)
     #[arg(short, long)]
     cert: Option<String>,
@@ -143,7 +151,9 @@ fn load_identity(args: &Args) -> Result<native_tls::Identity, Box<dyn std::error
     // First try PKCS#12 (.pfx) file
     if let Some(pfx_path) = &args.pfx {
         info!("Loading identity from PKCS#12 file: {}", pfx_path);
-        return mssql_mock_tds::load_identity_from_file(pfx_path, &args.pfx_password);
+        let pfx_password = std::env::var("MSSQL_MOCK_TDS_PFX_PASSWORD")
+            .unwrap_or_else(|_| args.pfx_password.clone());
+        return mssql_mock_tds::load_identity_from_file(pfx_path, &pfx_password);
     }
 
     // Then try PEM files
@@ -217,9 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MockTdsServer::new_with_strict_tls(&bind_addr, identity).await?
         }
     };
-    let authentication_mode = match args.auth_mode {
-        AuthMode::AcceptAll => AuthenticationMode::AcceptAll,
-        AuthMode::WindowsNtlm => AuthenticationMode::WindowsNtlm,
+    let authentication_mode = match args.ntlm_relay_sql {
+        Some(sql_server) => AuthenticationMode::WindowsNtlmRelay {
+            sql_server,
+            trust_server_certificate: args.relay_trust_server_certificate,
+        },
+        None => match args.auth_mode {
+            AuthMode::AcceptAll => AuthenticationMode::AcceptAll,
+            AuthMode::WindowsNtlm => AuthenticationMode::WindowsNtlm,
+        },
     };
     let server = server.with_authentication_mode(authentication_mode)?;
 
