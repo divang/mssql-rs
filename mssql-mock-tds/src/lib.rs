@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+mod ntlm_relay;
 pub mod protocol;
 pub mod query_response;
 pub mod server;

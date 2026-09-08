@@ -3,12 +3,13 @@
 
 //! Mock TDS Server implementation
 
+use crate::ntlm_relay::{NtlmRelaySession, apply_relay_outcome};
 use crate::protocol::{
     PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT,
     build_attention_ack_packet, build_done_token, build_error_response,
     build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
     build_prelogin_response, build_prelogin_response_with_fedauth, build_query_result,
-    build_routing_response, build_sspi_challenge_response, build_transaction_manager_response,
+    build_routing_response, build_transaction_manager_response, classify_login_relay_response,
     parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
 use crate::query_response::{QueryRegistry, TM_BEGIN_DELAY_KEY};
@@ -26,20 +27,42 @@ use tokio_native_tls::{TlsAcceptor, TlsStream};
 use tracing::{debug, error, info, warn};
 
 #[cfg(windows)]
+use crate::protocol::build_sspi_challenge_response;
+#[cfg(windows)]
 use crate::windows_sspi::{AcceptResult, WindowsNtlmAcceptor};
 
 const FEDAUTH_CHALLENGE_STS_URL: &str = "https://login.microsoftonline.com/test-tenant/";
 const FEDAUTH_CHALLENGE_SPN: &str = "https://database.windows.net/";
+#[cfg(windows)]
 const MAX_SSPI_TOKEN_SIZE: usize = 64 * 1024;
 
 /// Authentication policy used by the mock server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AuthenticationMode {
     /// Preserve historical mock behavior and accept structurally valid logins.
     #[default]
     AcceptAll,
     /// Validate integrated logins with the Windows NTLM SSPI package.
     WindowsNtlm,
+    /// Forward NTLM Type 1/2/3 packets to an upstream SQL Server for validation.
+    ///
+    /// The mock still answers PreLogin (and TLS) itself. LOGIN7 and SSPI packets
+    /// are sent to `sql_server` (`host:port`) so that SQL Server issues the
+    /// challenge and accepts or rejects the client's response.
+    WindowsNtlmRelay { sql_server: String },
+}
+
+impl AuthenticationMode {
+    fn is_windows_ntlm(&self) -> bool {
+        matches!(self, Self::WindowsNtlm)
+    }
+
+    fn ntlm_relay_sql(&self) -> Option<&str> {
+        match self {
+            Self::WindowsNtlmRelay { sql_server } => Some(sql_server.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of [`ConnectionProcessor::wait_out_delay_or_attention`].
@@ -59,6 +82,7 @@ enum DelayOutcome {
     Closed,
 }
 
+#[cfg(windows)]
 fn build_login_success_response() -> BytesMut {
     let mut response = build_login_ack();
     response.extend_from_slice(&build_done_token(0));
@@ -105,6 +129,8 @@ pub struct ConnectionProcessor {
     authenticated_identity: Option<String>,
     #[cfg(windows)]
     ntlm_acceptor: Option<WindowsNtlmAcceptor>,
+    /// Upstream SQL Server session used while relaying NTLM.
+    ntlm_relay: Option<NtlmRelaySession>,
     /// Access token received during FedAuth authentication (if any)
     received_token: Option<Vec<u8>>,
     /// User Agent received during authentication (if any)
@@ -175,6 +201,7 @@ impl ConnectionProcessor {
             authenticated_identity: None,
             #[cfg(windows)]
             ntlm_acceptor: None,
+            ntlm_relay: None,
             received_token: None,
             user_agent: None,
             received_server_name: None,
@@ -244,6 +271,59 @@ impl ConnectionProcessor {
         if let Some(store) = &self.connection_store {
             store.lock().await.store(self);
         }
+    }
+
+    async fn start_ntlm_relay(&mut self, packet: &[u8]) -> Result<BytesMut, ProtocolError> {
+        let sql_server = self
+            .authentication_mode
+            .ntlm_relay_sql()
+            .ok_or_else(|| ProtocolError::Protocol("NTLM relay is not configured".to_string()))?
+            .to_string();
+        if self.ntlm_relay.is_some() {
+            return Ok(build_error_response(
+                "NTLM relay authentication is already in progress",
+            ));
+        }
+        self.ntlm_relay = Some(NtlmRelaySession::connect(&sql_server).await?);
+        self.forward_ntlm_relay_packet(packet).await
+    }
+
+    async fn forward_ntlm_relay_packet(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<BytesMut, ProtocolError> {
+        let exchange_result = match self.ntlm_relay.as_mut() {
+            Some(relay) => relay.exchange(packet).await,
+            None => {
+                return Ok(build_error_response(
+                    "NTLM relay authentication has not started",
+                ));
+            }
+        };
+        let response = match exchange_result {
+            Ok(response) => response,
+            Err(error) => {
+                self.ntlm_relay = None;
+                return Err(error);
+            }
+        };
+        let sql_server = self
+            .ntlm_relay
+            .as_ref()
+            .expect("relay session exists after exchange")
+            .sql_server()
+            .to_string();
+        let (is_authenticated, identity, drop_session) =
+            apply_relay_outcome(classify_login_relay_response(&response), &sql_server);
+        self.is_authenticated = is_authenticated;
+        self.authenticated_identity = identity;
+        if drop_session {
+            self.ntlm_relay = None;
+        }
+        if self.is_authenticated {
+            self.record_to_store().await;
+        }
+        Ok(response)
     }
 
     /// Waits out `delay` (if any) before a registered response is sent,
@@ -353,7 +433,7 @@ impl ConnectionProcessor {
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
 
-                if self.authentication_mode == AuthenticationMode::WindowsNtlm {
+                if self.authentication_mode.is_windows_ntlm() {
                     if !auth_info.integrated_security {
                         return Ok(Some(build_error_response(
                             "Windows integrated authentication is required",
@@ -368,6 +448,20 @@ impl ConnectionProcessor {
                         .process_windows_ntlm_token(initial_token)
                         .await
                         .map(Some);
+                }
+
+                if self.authentication_mode.ntlm_relay_sql().is_some() {
+                    if !auth_info.integrated_security {
+                        return Ok(Some(build_error_response(
+                            "Windows integrated authentication is required",
+                        )));
+                    }
+                    if auth_info.sspi_token.is_none() {
+                        return Ok(Some(build_error_response(
+                            "Integrated authentication token is missing",
+                        )));
+                    }
+                    return self.start_ntlm_relay(&packet_data).await.map(Some);
                 }
 
                 // Check if redirection is configured
@@ -487,7 +581,12 @@ impl ConnectionProcessor {
             }
 
             PacketType::Sspi => {
-                if self.authentication_mode != AuthenticationMode::WindowsNtlm {
+                if self.authentication_mode.is_windows_ntlm() {
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    Some(self.process_windows_ntlm_token(packet_body).await?)
+                } else if self.authentication_mode.ntlm_relay_sql().is_some() {
+                    Some(self.forward_ntlm_relay_packet(&packet_data).await?)
+                } else {
                     warn!(
                         "Received SSPI continuation from {} but Windows NTLM is not configured",
                         self.addr
@@ -495,9 +594,6 @@ impl ConnectionProcessor {
                     Some(build_error_response(
                         "Windows integrated authentication is not configured",
                     ))
-                } else {
-                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
-                    Some(self.process_windows_ntlm_token(packet_body).await?)
                 }
             }
 
@@ -1034,6 +1130,7 @@ impl MockTdsServer {
             let tls_acceptor_clone = tls_acceptor.clone();
             let store_clone = Arc::clone(&connection_store);
             let redirection_clone = redirection.clone();
+            let authentication_mode = authentication_mode.clone();
 
             // Spawn a task to handle this connection
             tokio::spawn(async move {
@@ -1084,6 +1181,7 @@ impl MockTdsServer {
                             let tls_acceptor_clone = tls_acceptor.clone();
                             let store_clone = Arc::clone(&connection_store);
                             let redirection_clone = redirection.clone();
+                            let authentication_mode = authentication_mode.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone, authentication_mode).await {
@@ -1675,6 +1773,117 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        LoginRelayOutcome, build_prelogin_response, build_sspi_challenge_response,
+        build_sspi_message_packet, wrap_in_packet,
+    };
+
+    #[tokio::test]
+    async fn ntlm_relay_forwards_login7_and_sspi() {
+        let sql_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake SQL listener");
+        let sql_addr = sql_listener.local_addr().expect("SQL listener address");
+        let sql_task = tokio::spawn(async move {
+            let (mut socket, _) = sql_listener.accept().await.expect("SQL accept");
+            let mut header = [0u8; PACKET_HEADER_SIZE];
+
+            socket
+                .read_exact(&mut header)
+                .await
+                .expect("PreLogin header");
+            let remaining =
+                u16::from_be_bytes([header[2], header[3]]) as usize - PACKET_HEADER_SIZE;
+            let mut body = vec![0u8; remaining];
+            socket.read_exact(&mut body).await.expect("PreLogin body");
+            socket
+                .write_all(&build_prelogin_response())
+                .await
+                .expect("PreLogin response");
+
+            socket.read_exact(&mut header).await.expect("Login7 header");
+            let remaining =
+                u16::from_be_bytes([header[2], header[3]]) as usize - PACKET_HEADER_SIZE;
+            let mut body = vec![0u8; remaining];
+            socket.read_exact(&mut body).await.expect("Login7 body");
+            assert_eq!(header[0], PacketType::Login7 as u8);
+            socket
+                .write_all(
+                    &build_sspi_challenge_response(b"sql-type2-challenge").expect("SSPI challenge"),
+                )
+                .await
+                .expect("write SSPI challenge");
+
+            socket.read_exact(&mut header).await.expect("SSPI header");
+            let remaining =
+                u16::from_be_bytes([header[2], header[3]]) as usize - PACKET_HEADER_SIZE;
+            let mut body = vec![0u8; remaining];
+            socket.read_exact(&mut body).await.expect("SSPI body");
+            assert_eq!(header[0], PacketType::Sspi as u8);
+            let mut login_ack = build_login_ack();
+            login_ack.extend_from_slice(&build_done_token(0));
+            socket
+                .write_all(&wrap_in_packet(PacketType::TabularResult, login_ack))
+                .await
+                .expect("LoginAck response");
+        });
+
+        let query_registry = Arc::new(Mutex::new(QueryRegistry::new()));
+        let mut processor = ConnectionProcessor::new_with_options(
+            1,
+            "127.0.0.1:1433".parse().expect("client address"),
+            query_registry,
+            None,
+            None,
+            AuthenticationMode::WindowsNtlmRelay {
+                sql_server: sql_addr.to_string(),
+            },
+        );
+        let token = b"client-type1";
+        let token_offset = 94u16;
+        let mut login_payload = BytesMut::zeroed(token_offset as usize);
+        login_payload[25] = 0x80;
+        login_payload[78..80].copy_from_slice(&token_offset.to_le_bytes());
+        login_payload[80..82].copy_from_slice(&(token.len() as u16).to_le_bytes());
+        login_payload.extend_from_slice(token);
+        processor
+            .buffer
+            .extend_from_slice(&wrap_in_packet(PacketType::Login7, login_payload));
+
+        let mut client = tokio::io::empty();
+        let challenge = processor
+            .process_packet(&mut client)
+            .await
+            .expect("process Login7")
+            .expect("SSPI challenge response");
+        assert_eq!(
+            classify_login_relay_response(&challenge),
+            LoginRelayOutcome::Continue
+        );
+        assert!(!processor.is_authenticated);
+        assert!(processor.ntlm_relay.is_some());
+
+        processor
+            .buffer
+            .extend_from_slice(&build_sspi_message_packet(b"client-type3").expect("SSPI packet"));
+        let login_ack = processor
+            .process_packet(&mut client)
+            .await
+            .expect("process SSPI")
+            .expect("LoginAck response");
+        assert_eq!(
+            classify_login_relay_response(&login_ack),
+            LoginRelayOutcome::Complete
+        );
+        assert!(processor.is_authenticated);
+        assert_eq!(
+            processor.authenticated_identity.as_deref(),
+            Some(format!("ntlm-relay:{sql_addr}").as_str())
+        );
+        assert!(processor.ntlm_relay.is_none());
+
+        sql_task.await.expect("fake SQL task");
+    }
 
     #[tokio::test]
     async fn test_server_creation() {

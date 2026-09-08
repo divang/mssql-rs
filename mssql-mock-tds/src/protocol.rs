@@ -233,18 +233,18 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             short_length as usize
         };
 
-        if sspi_length > 0 {
-            if let Some(sspi_end) = sspi_offset.checked_add(sspi_length) {
-                if sspi_end <= data.len() {
-                    auth_info.sspi_token = Some(data[sspi_offset..sspi_end].to_vec());
-                } else {
-                    debug!(
-                        sspi_offset,
-                        sspi_length,
-                        packet_length = data.len(),
-                        "LOGIN7 SSPI field is out of bounds"
-                    );
-                }
+        if sspi_length > 0
+            && let Some(sspi_end) = sspi_offset.checked_add(sspi_length)
+        {
+            if sspi_end <= data.len() {
+                auth_info.sspi_token = Some(data[sspi_offset..sspi_end].to_vec());
+            } else {
+                debug!(
+                    sspi_offset,
+                    sspi_length,
+                    packet_length = data.len(),
+                    "LOGIN7 SSPI field is out of bounds"
+                );
             }
         }
     }
@@ -396,6 +396,178 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
     }
 
     auth_info
+}
+
+/// PreLogin ENCRYPTION option values (TDS spec).
+pub const ENCRYPT_OFF: u8 = 0x00;
+pub const ENCRYPT_ON: u8 = 0x01;
+pub const ENCRYPT_NOT_SUP: u8 = 0x02;
+pub const ENCRYPT_REQ: u8 = 0x03;
+
+/// How an upstream SQL Server login response should be treated by the NTLM relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRelayOutcome {
+    /// Server sent an SSPI challenge; forward it and wait for the client Type 3.
+    Continue,
+    /// Server sent LoginAck; integrated authentication succeeded.
+    Complete,
+    /// Server sent an error without LoginAck.
+    Failed,
+}
+
+/// Client PreLogin requesting no encryption, used when the relay opens a TDS
+/// session to an upstream SQL Server.
+pub fn build_client_prelogin() -> BytesMut {
+    let mut body = BytesMut::new();
+    // VERSION + ENCRYPTION + TERMINATOR directory (11 bytes), then values.
+    body.put_u8(0x00);
+    body.put_u16(0x000B);
+    body.put_u16(0x0006);
+    body.put_u8(0x01);
+    body.put_u16(0x0011);
+    body.put_u16(0x0001);
+    body.put_u8(0xFF);
+    body.put_u8(0x10);
+    body.put_u8(0x00);
+    body.put_u16(0x0000);
+    body.put_u16(0x0000);
+    body.put_u8(ENCRYPT_NOT_SUP);
+    wrap_in_packet(PacketType::PreLogin, body)
+}
+
+/// Read the ENCRYPTION option from a PreLogin packet (header optional).
+pub fn parse_prelogin_encryption(packet: &[u8]) -> Result<u8, ProtocolError> {
+    let body = if packet.len() >= PACKET_HEADER_SIZE {
+        &packet[PACKET_HEADER_SIZE..]
+    } else {
+        packet
+    };
+    let mut i = 0usize;
+    while i < body.len() {
+        let token = body[i];
+        if token == 0xFF {
+            break;
+        }
+        if i + 5 > body.len() {
+            return Err(ProtocolError::Protocol(
+                "Truncated PreLogin option directory".to_string(),
+            ));
+        }
+        let offset = u16::from_be_bytes([body[i + 1], body[i + 2]]) as usize;
+        let length = u16::from_be_bytes([body[i + 3], body[i + 4]]) as usize;
+        if token == 0x01 {
+            if length == 0 || offset >= body.len() {
+                return Err(ProtocolError::Protocol(
+                    "Invalid PreLogin ENCRYPTION option".to_string(),
+                ));
+            }
+            return Ok(body[offset]);
+        }
+        i += 5;
+    }
+    Ok(ENCRYPT_NOT_SUP)
+}
+
+/// Wrap an SSPI token in a client SSPI message (packet type 0x11).
+pub fn build_sspi_message_packet(token: &[u8]) -> Result<BytesMut, ProtocolError> {
+    let total_length = PACKET_HEADER_SIZE
+        .checked_add(token.len())
+        .ok_or_else(|| ProtocolError::Protocol("SSPI packet length overflow".to_string()))?;
+    let total_length_u16 = u16::try_from(total_length).map_err(|_| {
+        ProtocolError::Protocol("SSPI packet exceeds the TDS packet length limit".to_string())
+    })?;
+    let mut packet = BytesMut::with_capacity(total_length);
+    PacketHeader::new(PacketType::Sspi, total_length_u16, 1).write(&mut packet);
+    packet.extend_from_slice(token);
+    Ok(packet)
+}
+
+/// Classify a tabular-result login stream from SQL Server (SSPI vs LoginAck vs error).
+pub fn classify_login_relay_response(packet: &[u8]) -> LoginRelayOutcome {
+    let mut offset = 0usize;
+    let mut saw_sspi = false;
+    let mut saw_login_ack = false;
+    while offset + PACKET_HEADER_SIZE <= packet.len() {
+        let mut header_bytes = &packet[offset..];
+        let Ok(header) = PacketHeader::parse(&mut header_bytes) else {
+            break;
+        };
+        let end = offset + header.length as usize;
+        if end > packet.len() {
+            break;
+        }
+        walk_login_tokens(
+            &packet[offset + PACKET_HEADER_SIZE..end],
+            |token| match token {
+                TokenType::Sspi => saw_sspi = true,
+                TokenType::LoginAck => saw_login_ack = true,
+                _ => {}
+            },
+        );
+        offset = end;
+        if header.status.is_end_of_message() {
+            break;
+        }
+    }
+    if saw_login_ack {
+        LoginRelayOutcome::Complete
+    } else if saw_sspi {
+        LoginRelayOutcome::Continue
+    } else {
+        LoginRelayOutcome::Failed
+    }
+}
+
+fn walk_login_tokens(body: &[u8], mut visit: impl FnMut(TokenType)) {
+    let mut i = 0usize;
+    while i < body.len() {
+        let Ok(token) = TokenType::try_from_u8(body[i]) else {
+            break;
+        };
+        visit(token);
+        match token {
+            TokenType::Done | TokenType::DoneProc | TokenType::DoneInProc => {
+                i = i.saturating_add(13);
+            }
+            TokenType::Sspi
+            | TokenType::LoginAck
+            | TokenType::Error
+            | TokenType::Info
+            | TokenType::EnvChange => {
+                if i + 3 > body.len() {
+                    break;
+                }
+                let len = u16::from_le_bytes([body[i + 1], body[i + 2]]) as usize;
+                i = i.saturating_add(3).saturating_add(len);
+            }
+            TokenType::FeatureExtAck => {
+                // FeatureExtAck is a list of feature id + u32 length entries,
+                // terminated by 0xFF. Skip the rest of the body.
+                break;
+            }
+            TokenType::ColMetadata | TokenType::Row | TokenType::FedAuthInfo => break,
+        }
+    }
+}
+
+impl TokenType {
+    fn try_from_u8(value: u8) -> Result<Self, ()> {
+        match value {
+            0x81 => Ok(Self::ColMetadata),
+            0xD1 => Ok(Self::Row),
+            0xFD => Ok(Self::Done),
+            0xFE => Ok(Self::DoneProc),
+            0xFF => Ok(Self::DoneInProc),
+            0xEE => Ok(Self::FedAuthInfo),
+            0xE3 => Ok(Self::EnvChange),
+            0xAD => Ok(Self::LoginAck),
+            0xAA => Ok(Self::Error),
+            0xAB => Ok(Self::Info),
+            0xAE => Ok(Self::FeatureExtAck),
+            0xED => Ok(Self::Sspi),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Build a TDS tabular-result packet containing an opaque SSPI challenge.
@@ -1082,7 +1254,7 @@ pub fn build_error_response(message: &str) -> BytesMut {
 }
 
 /// Wrap token data in a TDS packet
-fn wrap_in_packet(packet_type: PacketType, data: BytesMut) -> BytesMut {
+pub(crate) fn wrap_in_packet(packet_type: PacketType, data: BytesMut) -> BytesMut {
     let total_length = (PACKET_HEADER_SIZE + data.len()) as u16;
 
     let mut packet = BytesMut::with_capacity(total_length as usize);
@@ -1314,6 +1486,48 @@ mod tests {
             challenge.len()
         );
         assert_eq!(&response[PACKET_HEADER_SIZE + 3..], challenge);
+    }
+
+    #[test]
+    fn test_client_prelogin_advertises_no_encryption() {
+        let packet = build_client_prelogin();
+        assert_eq!(packet[0], PacketType::PreLogin as u8);
+        assert_eq!(
+            parse_prelogin_encryption(&packet).expect("client PreLogin should parse"),
+            ENCRYPT_NOT_SUP
+        );
+    }
+
+    #[test]
+    fn test_classify_login_relay_sspi_and_loginack() {
+        let challenge =
+            build_sspi_challenge_response(b"type-2").expect("challenge packet should build");
+        assert_eq!(
+            classify_login_relay_response(&challenge),
+            LoginRelayOutcome::Continue
+        );
+
+        let mut ack = build_login_ack();
+        ack.extend_from_slice(&build_done_token(0));
+        let packet = wrap_in_packet(PacketType::TabularResult, ack);
+        assert_eq!(
+            classify_login_relay_response(&packet),
+            LoginRelayOutcome::Complete
+        );
+
+        let error = build_error_response("login failed");
+        assert_eq!(
+            classify_login_relay_response(&error),
+            LoginRelayOutcome::Failed
+        );
+        assert_eq!(
+            classify_login_relay_response(&[]),
+            LoginRelayOutcome::Failed
+        );
+        assert_eq!(
+            classify_login_relay_response(&[PacketType::TabularResult as u8]),
+            LoginRelayOutcome::Failed
+        );
     }
 
     #[test]
