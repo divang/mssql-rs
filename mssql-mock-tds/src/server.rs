@@ -8,8 +8,8 @@ use crate::protocol::{
     build_attention_ack_packet, build_done_token, build_error_response,
     build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
     build_prelogin_response, build_prelogin_response_with_fedauth, build_query_result,
-    build_routing_response, build_transaction_manager_response, parse_fedauth_token,
-    parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
+    build_routing_response, build_sspi_challenge_response, build_transaction_manager_response,
+    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
 use crate::query_response::{QueryRegistry, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
@@ -25,8 +25,22 @@ use tokio::sync::Mutex;
 use tokio_native_tls::{TlsAcceptor, TlsStream};
 use tracing::{debug, error, info, warn};
 
+#[cfg(windows)]
+use crate::windows_sspi::{AcceptResult, WindowsNtlmAcceptor};
+
 const FEDAUTH_CHALLENGE_STS_URL: &str = "https://login.microsoftonline.com/test-tenant/";
 const FEDAUTH_CHALLENGE_SPN: &str = "https://database.windows.net/";
+const MAX_SSPI_TOKEN_SIZE: usize = 64 * 1024;
+
+/// Authentication policy used by the mock server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthenticationMode {
+    /// Preserve historical mock behavior and accept structurally valid logins.
+    #[default]
+    AcceptAll,
+    /// Validate integrated logins with the Windows NTLM SSPI package.
+    WindowsNtlm,
+}
 
 /// Outcome of [`ConnectionProcessor::wait_out_delay_or_attention`].
 enum DelayOutcome {
@@ -43,6 +57,16 @@ enum DelayOutcome {
     /// instead of surfacing a `ProtocolError` that would skip past recording
     /// the connection (e.g. `connection_store.store`).
     Closed,
+}
+
+fn build_login_success_response() -> BytesMut {
+    let mut response = build_login_ack();
+    response.extend_from_slice(&build_done_token(0));
+    let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
+    let mut packet = BytesMut::with_capacity(total_length as usize);
+    PacketHeader::new(PacketType::TabularResult, total_length, 1).write(&mut packet);
+    packet.extend_from_slice(&response);
+    packet
 }
 
 /// Configuration for connection redirection
@@ -77,6 +101,10 @@ pub struct ConnectionProcessor {
     addr: SocketAddr,
     /// Whether the client has authenticated
     is_authenticated: bool,
+    authentication_mode: AuthenticationMode,
+    authenticated_identity: Option<String>,
+    #[cfg(windows)]
+    ntlm_acceptor: Option<WindowsNtlmAcceptor>,
     /// Access token received during FedAuth authentication (if any)
     received_token: Option<Vec<u8>>,
     /// User Agent received during authentication (if any)
@@ -103,19 +131,14 @@ impl ConnectionProcessor {
         query_registry: Arc<Mutex<QueryRegistry>>,
         connection_store: Option<Arc<Mutex<ConnectionStore>>>,
     ) -> Self {
-        Self {
+        Self::new_with_options(
             conn_id,
             addr,
-            is_authenticated: false,
-            received_token: None,
-            user_agent: None,
-            received_server_name: None,
-            awaiting_fedauth_token: false,
             query_registry,
-            buffer: BytesMut::with_capacity(4096),
-            redirection: None,
             connection_store,
-        }
+            None,
+            AuthenticationMode::AcceptAll,
+        )
     }
 
     /// Create a new connection processor with redirection configuration
@@ -126,10 +149,32 @@ impl ConnectionProcessor {
         connection_store: Option<Arc<Mutex<ConnectionStore>>>,
         redirection: Option<RedirectionConfig>,
     ) -> Self {
+        Self::new_with_options(
+            conn_id,
+            addr,
+            query_registry,
+            connection_store,
+            redirection,
+            AuthenticationMode::AcceptAll,
+        )
+    }
+
+    fn new_with_options(
+        conn_id: u64,
+        addr: SocketAddr,
+        query_registry: Arc<Mutex<QueryRegistry>>,
+        connection_store: Option<Arc<Mutex<ConnectionStore>>>,
+        redirection: Option<RedirectionConfig>,
+        authentication_mode: AuthenticationMode,
+    ) -> Self {
         Self {
             conn_id,
             addr,
             is_authenticated: false,
+            authentication_mode,
+            authenticated_identity: None,
+            #[cfg(windows)]
+            ntlm_acceptor: None,
             received_token: None,
             user_agent: None,
             received_server_name: None,
@@ -154,6 +199,10 @@ impl ConnectionProcessor {
     /// Check if the client is authenticated
     pub fn is_authenticated(&self) -> bool {
         self.is_authenticated
+    }
+
+    pub fn authenticated_identity(&self) -> Option<&str> {
+        self.authenticated_identity.as_deref()
     }
 
     /// Get the received access token (raw bytes)
@@ -304,6 +353,23 @@ impl ConnectionProcessor {
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
 
+                if self.authentication_mode == AuthenticationMode::WindowsNtlm {
+                    if !auth_info.integrated_security {
+                        return Ok(Some(build_error_response(
+                            "Windows integrated authentication is required",
+                        )));
+                    }
+                    let Some(initial_token) = auth_info.sspi_token.as_deref() else {
+                        return Ok(Some(build_error_response(
+                            "Integrated authentication token is missing",
+                        )));
+                    };
+                    return self
+                        .process_windows_ntlm_token(initial_token)
+                        .await
+                        .map(Some);
+                }
+
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
                     self.awaiting_fedauth_token = false;
@@ -417,6 +483,21 @@ impl ConnectionProcessor {
                             Some(build_error_response(&format!("FedAuth parse error: {}", e)))
                         }
                     }
+                }
+            }
+
+            PacketType::Sspi => {
+                if self.authentication_mode != AuthenticationMode::WindowsNtlm {
+                    warn!(
+                        "Received SSPI continuation from {} but Windows NTLM is not configured",
+                        self.addr
+                    );
+                    Some(build_error_response(
+                        "Windows integrated authentication is not configured",
+                    ))
+                } else {
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    Some(self.process_windows_ntlm_token(packet_body).await?)
                 }
             }
 
@@ -583,6 +664,62 @@ impl ConnectionProcessor {
         Ok(response)
     }
 
+    #[cfg(windows)]
+    async fn process_windows_ntlm_token(
+        &mut self,
+        token: &[u8],
+    ) -> Result<BytesMut, ProtocolError> {
+        if self.is_authenticated {
+            return Ok(build_error_response("Authentication is already complete"));
+        }
+        if self.ntlm_acceptor.is_none() {
+            self.ntlm_acceptor = Some(
+                WindowsNtlmAcceptor::new(MAX_SSPI_TOKEN_SIZE)
+                    .map_err(|error| ProtocolError::Protocol(error.to_string()))?,
+            );
+        }
+        let result = self
+            .ntlm_acceptor
+            .as_mut()
+            .expect("NTLM acceptor was initialized")
+            .accept(token);
+
+        match result {
+            Ok(AcceptResult::Continue(challenge)) => build_sspi_challenge_response(&challenge),
+            Ok(AcceptResult::Complete {
+                identity,
+                final_token,
+            }) => {
+                if !final_token.is_empty() {
+                    return Err(ProtocolError::Protocol(
+                        "NTLM completed with an unsupported final server token".to_string(),
+                    ));
+                }
+                info!(client = %self.addr, identity = %identity, "Windows NTLM authentication succeeded");
+                self.authenticated_identity = Some(identity);
+                self.is_authenticated = true;
+                self.ntlm_acceptor = None;
+                self.record_to_store().await;
+                Ok(build_login_success_response())
+            }
+            Err(error) => {
+                warn!(client = %self.addr, status = %error, "Windows NTLM authentication failed");
+                self.ntlm_acceptor = None;
+                Ok(build_error_response("Login failed"))
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn process_windows_ntlm_token(
+        &mut self,
+        _token: &[u8],
+    ) -> Result<BytesMut, ProtocolError> {
+        Ok(build_error_response(
+            "Windows NTLM authentication is only available on Windows",
+        ))
+    }
+
     /// Checks whether a complete `Attention` (0x06) packet is now sitting at
     /// the front of the buffer — having arrived while [`process_packet`]
     /// was racing a delayed response against further reads — and, if so,
@@ -630,6 +767,8 @@ pub struct ConnectionInfo {
     pub received_token: Option<Vec<u8>>,
     /// Whether the client authenticated successfully
     pub authenticated: bool,
+    /// Canonical identity returned by Windows SSPI, if applicable.
+    pub authenticated_identity: Option<String>,
     /// User Agent received during authentication (if any)
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
@@ -672,6 +811,7 @@ impl ConnectionStore {
             addr: processor.addr(),
             received_token: processor.received_token().map(|t| t.to_vec()),
             authenticated: processor.is_authenticated(),
+            authenticated_identity: processor.authenticated_identity().map(str::to_owned),
             user_agent: processor.user_agent.clone(),
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
         };
@@ -716,6 +856,7 @@ pub struct MockTdsServer {
     redirection: Option<RedirectionConfig>,
     /// Monotonic counter assigning a unique id to each accepted connection
     connection_counter: Arc<AtomicU64>,
+    authentication_mode: AuthenticationMode,
 }
 
 impl MockTdsServer {
@@ -784,17 +925,18 @@ impl MockTdsServer {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let tls_acceptor = identity
-            .map(|id| {
+        let tls_acceptor = match identity {
+            Some(id) => {
                 let mut builder = native_tls::TlsAcceptor::builder(id);
                 if strict_mode {
                     builder.accept_alpn(&[mssql_tds::core::TDS_8_ALPN_PROTOCOL]);
                 }
-                builder.build().map(TlsAcceptor::from).map_err(|error| {
+                Some(builder.build().map(TlsAcceptor::from).map_err(|error| {
                     std::io::Error::other(format!("Failed to build TLS acceptor: {}", error))
-                })
-            })
-            .transpose()?;
+                })?)
+            }
+            None => None,
+        };
 
         let has_tls = tls_acceptor.is_some();
         if strict_mode {
@@ -830,7 +972,30 @@ impl MockTdsServer {
             connection_store: Arc::new(Mutex::new(ConnectionStore::new())),
             redirection,
             connection_counter: Arc::new(AtomicU64::new(0)),
+            authentication_mode: AuthenticationMode::AcceptAll,
         })
+    }
+
+    /// Select the authentication policy. Windows NTLM requires encrypted TDS.
+    pub fn with_authentication_mode(
+        mut self,
+        authentication_mode: AuthenticationMode,
+    ) -> Result<Self, std::io::Error> {
+        if authentication_mode == AuthenticationMode::WindowsNtlm && self.tls_acceptor.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows NTLM authentication requires TLS",
+            ));
+        }
+        #[cfg(not(windows))]
+        if authentication_mode == AuthenticationMode::WindowsNtlm {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Windows NTLM authentication is only available on Windows",
+            ));
+        }
+        self.authentication_mode = authentication_mode;
+        Ok(self)
     }
 
     /// Get a reference to the query registry for registering custom responses
@@ -858,6 +1023,7 @@ impl MockTdsServer {
         let connection_store = self.connection_store;
         let redirection = self.redirection.map(Arc::new);
         let connection_counter = self.connection_counter;
+        let authentication_mode = self.authentication_mode;
 
         loop {
             let (socket, addr) = listener.accept().await?;
@@ -880,6 +1046,7 @@ impl MockTdsServer {
                     strict_mode,
                     store_clone,
                     redirection_clone,
+                    authentication_mode,
                 )
                 .await
                 {
@@ -901,6 +1068,7 @@ impl MockTdsServer {
         let connection_store = self.connection_store;
         let redirection = self.redirection.map(Arc::new);
         let connection_counter = self.connection_counter;
+        let authentication_mode = self.authentication_mode;
 
         tokio::select! {
             result = async {
@@ -918,7 +1086,7 @@ impl MockTdsServer {
                             let redirection_clone = redirection.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone).await {
+                                if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone, authentication_mode).await {
                                     error!("Error handling connection from {}: {}", addr, e);
                                 }
                             });
@@ -950,6 +1118,7 @@ async fn handle_connection_with_tls(
     strict_mode: bool,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
+    authentication_mode: AuthenticationMode,
 ) -> Result<(), ProtocolError> {
     if strict_mode {
         // TDS 8.0 Strict mode: TLS handshake happens immediately on the socket
@@ -979,6 +1148,7 @@ async fn handle_connection_with_tls(
             query_registry,
             connection_store,
             redirection,
+            authentication_mode,
         )
         .await
     } else {
@@ -1017,6 +1187,7 @@ async fn handle_connection_with_tls(
                 query_registry,
                 connection_store,
                 redirection,
+                authentication_mode,
             )
             .await
         } else {
@@ -1028,6 +1199,7 @@ async fn handle_connection_with_tls(
                 query_registry,
                 connection_store,
                 redirection,
+                authentication_mode,
             )
             .await
         }
@@ -1094,16 +1266,18 @@ async fn handle_strict_encrypted_connection(
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
+    authentication_mode: AuthenticationMode,
 ) -> Result<(), ProtocolError> {
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor = ConnectionProcessor::new_with_redirection(
+    let mut processor = ConnectionProcessor::new_with_options(
         conn_id,
         addr,
         query_registry,
         Some(Arc::clone(&connection_store)),
         redir_config,
+        authentication_mode,
     );
     let mut prelogin_handled = false;
 
@@ -1219,16 +1393,18 @@ async fn handle_encrypted_tds_wrapped_connection(
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
+    authentication_mode: AuthenticationMode,
 ) -> Result<(), ProtocolError> {
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor = ConnectionProcessor::new_with_redirection(
+    let mut processor = ConnectionProcessor::new_with_options(
         conn_id,
         addr,
         query_registry,
         Some(Arc::clone(&connection_store)),
         redir_config,
+        authentication_mode,
     );
 
     loop {
@@ -1268,16 +1444,18 @@ async fn handle_unencrypted_connection(
     query_registry: Arc<Mutex<QueryRegistry>>,
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
+    authentication_mode: AuthenticationMode,
 ) -> Result<(), ProtocolError> {
     let redir_config = redirection
         .as_ref()
         .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
-    let mut processor = ConnectionProcessor::new_with_redirection(
+    let mut processor = ConnectionProcessor::new_with_options(
         conn_id,
         addr,
         query_registry,
         Some(Arc::clone(&connection_store)),
         redir_config,
+        authentication_mode,
     );
 
     loop {
@@ -1379,6 +1557,10 @@ async fn handle_connection(
 
                     Some(packet)
                 }
+
+                PacketType::Sspi => Some(build_error_response(
+                    "Windows integrated authentication is not configured",
+                )),
 
                 PacketType::SqlBatch => {
                     if !is_authenticated {

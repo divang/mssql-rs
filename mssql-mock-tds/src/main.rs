@@ -23,7 +23,7 @@
 //! ```
 
 use clap::{Parser, ValueEnum};
-use mssql_mock_tds::MockTdsServer;
+use mssql_mock_tds::{AuthenticationMode, MockTdsServer};
 #[cfg(not(windows))]
 use std::fs;
 use std::sync::Arc;
@@ -39,6 +39,14 @@ enum TlsMode {
     Optional,
     /// TDS 8.0 style strict TLS (TLS handshake immediately on connection)
     Strict,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuthMode {
+    /// Protocol mock only; credentials are not validated.
+    AcceptAll,
+    /// Validate integrated authentication through Windows SSPI using NTLM.
+    WindowsNtlm,
 }
 
 #[derive(Parser, Debug)]
@@ -61,6 +69,10 @@ struct Args {
     /// TLS mode: none, optional (TDS 7.4), or strict (TDS 8.0)
     #[arg(short = 'm', long, value_enum, default_value = "none")]
     tls_mode: TlsMode,
+
+    /// Authentication policy: accept-all or Windows domain-backed NTLM.
+    #[arg(long, value_enum, default_value = "accept-all")]
+    auth_mode: AuthMode,
 
     /// Path to PEM certificate file (required for TLS modes)
     #[arg(short, long)]
@@ -205,6 +217,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MockTdsServer::new_with_strict_tls(&bind_addr, identity).await?
         }
     };
+    let authentication_mode = match args.auth_mode {
+        AuthMode::AcceptAll => AuthenticationMode::AcceptAll,
+        AuthMode::WindowsNtlm => AuthenticationMode::WindowsNtlm,
+    };
+    let server = server.with_authentication_mode(authentication_mode)?;
 
     let actual_addr = server.local_addr();
     info!("Mock TDS Server is running on {}", actual_addr);

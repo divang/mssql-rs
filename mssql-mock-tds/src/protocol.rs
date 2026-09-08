@@ -34,6 +34,7 @@ pub enum ProtocolError {
 pub enum PacketType {
     SqlBatch = 0x01,
     FedAuthToken = 0x08,
+    Sspi = 0x11,
     PreLogin = 0x12,
     TabularResult = 0x04,
     Attention = 0x06,
@@ -49,6 +50,7 @@ impl TryFrom<u8> for PacketType {
         match value {
             0x01 => Ok(PacketType::SqlBatch),
             0x08 => Ok(PacketType::FedAuthToken),
+            0x11 => Ok(PacketType::Sspi),
             0x12 => Ok(PacketType::PreLogin),
             0x04 => Ok(PacketType::TabularResult),
             0x06 => Ok(PacketType::Attention),
@@ -159,6 +161,7 @@ pub enum TokenType {
     Error = 0xAA,
     Info = 0xAB,
     FeatureExtAck = 0xAE,
+    Sspi = 0xED,
 }
 
 /// FedAuth feature extension ID
@@ -170,6 +173,10 @@ pub const FEATURE_EXT_TERMINATOR: u8 = 0xFF;
 /// Parsed Login7 authentication info
 #[derive(Debug, Clone, Default)]
 pub struct Login7AuthInfo {
+    /// Whether the client requested Windows integrated authentication.
+    pub integrated_security: bool,
+    /// Initial opaque SSPI token carried by LOGIN7, if present.
+    pub sspi_token: Option<Vec<u8>>,
     /// Whether FedAuth feature was present
     pub has_fedauth: bool,
     /// Access token bytes (UTF-16LE encoded) if present
@@ -206,6 +213,41 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
     // The packet_body should already have TDS header stripped (done in server.rs)
     let data = packet_data;
+
+    // OptionFlags2 bit 7 requests integrated security. The SSPI offset/length
+    // pair is at bytes 78-81. A length of 0xffff uses cbSSPILong at 90-93.
+    if data.len() > 25 {
+        auth_info.integrated_security = data[25] & 0x80 != 0;
+    }
+
+    if auth_info.integrated_security && data.len() >= 82 {
+        let sspi_offset = u16::from_le_bytes([data[78], data[79]]) as usize;
+        let short_length = u16::from_le_bytes([data[80], data[81]]);
+        let sspi_length = if short_length == u16::MAX {
+            if data.len() >= 94 {
+                u32::from_le_bytes([data[90], data[91], data[92], data[93]]) as usize
+            } else {
+                0
+            }
+        } else {
+            short_length as usize
+        };
+
+        if sspi_length > 0 {
+            if let Some(sspi_end) = sspi_offset.checked_add(sspi_length) {
+                if sspi_end <= data.len() {
+                    auth_info.sspi_token = Some(data[sspi_offset..sspi_end].to_vec());
+                } else {
+                    debug!(
+                        sspi_offset,
+                        sspi_length,
+                        packet_length = data.len(),
+                        "LOGIN7 SSPI field is out of bounds"
+                    );
+                }
+            }
+        }
+    }
 
     if data.len() < 56 {
         debug!("Login7 packet too short for server name parsing");
@@ -354,6 +396,27 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
     }
 
     auth_info
+}
+
+/// Build a TDS tabular-result packet containing an opaque SSPI challenge.
+pub fn build_sspi_challenge_response(challenge: &[u8]) -> Result<BytesMut, ProtocolError> {
+    let challenge_length = u16::try_from(challenge.len()).map_err(|_| {
+        ProtocolError::Protocol("SSPI challenge exceeds the TDS token length limit".to_string())
+    })?;
+    let token_length = 1usize + 2 + challenge.len();
+    let total_length = PACKET_HEADER_SIZE
+        .checked_add(token_length)
+        .ok_or_else(|| ProtocolError::Protocol("SSPI response length overflow".to_string()))?;
+    let total_length_u16 = u16::try_from(total_length).map_err(|_| {
+        ProtocolError::Protocol("SSPI response exceeds the TDS packet length limit".to_string())
+    })?;
+
+    let mut packet = BytesMut::with_capacity(total_length);
+    PacketHeader::new(PacketType::TabularResult, total_length_u16, 1).write(&mut packet);
+    packet.put_u8(TokenType::Sspi as u8);
+    packet.put_u16_le(challenge_length);
+    packet.extend_from_slice(challenge);
+    Ok(packet)
 }
 
 /// Build a PreLogin response packet
@@ -603,9 +666,9 @@ pub fn build_login_ack() -> BytesMut {
     // New value length: 5 bytes for collation
     token_data.put_u8(5);
 
-    // Collation data: SQL_Latin1_General_CP1_CI_AS (LCID: 0x0409, flags: 0x00D001, sortId: 0x00)
-    token_data.put_u32_le(0x09040000); // LCID (little endian)
-    token_data.put_u8(0xD0); // Flags
+    // Collation data: SQL_Latin1_General_CP1_CI_AS.
+    // LCID/flags occupy the first four little-endian bytes; sort ID 52 is last.
+    token_data.extend_from_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]);
 
     // Old value length: 0 (no old value)
     token_data.put_u8(0);
@@ -1185,9 +1248,91 @@ mod tests {
     }
 
     #[test]
+    fn test_sspi_packet_type_parse() {
+        assert_eq!(
+            PacketType::try_from(0x11).expect("0x11 is the TDS SSPI packet type"),
+            PacketType::Sspi
+        );
+    }
+
+    #[test]
+    fn test_parse_login7_integrated_security_token() {
+        let token = b"opaque-negotiate-token";
+        let token_offset = 94u16;
+        let mut payload = BytesMut::zeroed(token_offset as usize);
+        payload[25] = 0x80;
+        payload[78..80].copy_from_slice(&token_offset.to_le_bytes());
+        payload[80..82].copy_from_slice(&(token.len() as u16).to_le_bytes());
+        payload.extend_from_slice(token);
+
+        let result = parse_login7_auth(&payload);
+        assert!(result.integrated_security);
+        assert_eq!(result.sspi_token.as_deref(), Some(token.as_slice()));
+    }
+
+    #[test]
+    fn test_parse_login7_extended_sspi_length() {
+        let token = b"extended-length-token";
+        let token_offset = 94u16;
+        let mut payload = BytesMut::zeroed(token_offset as usize);
+        payload[25] = 0x80;
+        payload[78..80].copy_from_slice(&token_offset.to_le_bytes());
+        payload[80..82].copy_from_slice(&u16::MAX.to_le_bytes());
+        payload[90..94].copy_from_slice(&(token.len() as u32).to_le_bytes());
+        payload.extend_from_slice(token);
+
+        let result = parse_login7_auth(&payload);
+        assert!(result.integrated_security);
+        assert_eq!(result.sspi_token.as_deref(), Some(token.as_slice()));
+    }
+
+    #[test]
+    fn test_parse_login7_rejects_out_of_bounds_sspi_field() {
+        let mut payload = BytesMut::zeroed(94);
+        payload[25] = 0x80;
+        payload[78..80].copy_from_slice(&90u16.to_le_bytes());
+        payload[80..82].copy_from_slice(&32u16.to_le_bytes());
+
+        let result = parse_login7_auth(&payload);
+        assert!(result.integrated_security);
+        assert!(result.sspi_token.is_none());
+    }
+
+    #[test]
+    fn test_build_sspi_challenge_response() {
+        let challenge = b"opaque-challenge";
+        let response = build_sspi_challenge_response(challenge)
+            .expect("a small SSPI challenge should fit in one TDS packet");
+
+        assert_eq!(response[0], PacketType::TabularResult as u8);
+        assert_eq!(response[PACKET_HEADER_SIZE], TokenType::Sspi as u8);
+        assert_eq!(
+            u16::from_le_bytes([
+                response[PACKET_HEADER_SIZE + 1],
+                response[PACKET_HEADER_SIZE + 2]
+            ]) as usize,
+            challenge.len()
+        );
+        assert_eq!(&response[PACKET_HEADER_SIZE + 3..], challenge);
+    }
+
+    #[test]
     fn test_prelogin_response() {
         let response = build_prelogin_response();
         assert!(response.len() >= PACKET_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_login_ack_uses_supported_sql_latin1_collation() {
+        let response = build_login_ack();
+        let env_change = response
+            .windows(4)
+            .position(|bytes| bytes == [TokenType::EnvChange as u8, 8, 0, 7])
+            .expect("LoginAck should contain a collation EnvChange token");
+        assert_eq!(
+            &response[env_change + 5..env_change + 10],
+            &[0x09, 0x04, 0xD0, 0x00, 0x34]
+        );
     }
 
     #[test]

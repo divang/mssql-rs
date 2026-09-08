@@ -11,7 +11,8 @@ This crate provides a lightweight mock server that implements enough of the TDS 
 - ✅ **PreLogin negotiation** - Handles PreLogin packets and signals encryption support
 - ✅ **TLS encryption (TDS 7.4)** - Supports optional TLS with wrapped TDS packets
 - ✅ **Strict TLS (TDS 8.0)** - Supports strict TLS mode where TLS starts immediately
-- ✅ **Login7 authentication** - Accepts login requests and sends LoginAck responses
+- ✅ **Login7 protocol handling** - Accepts login requests and sends LoginAck responses
+- ✅ **Windows integrated authentication** - On Windows, `--auth-mode windows-ntlm` validates LOGIN7/SSPI credentials through the operating system and domain secure channel
 - ✅ **Packet size negotiation** - Properly negotiates packet size via EnvChange tokens
 - ✅ **Database collation** - Returns collation information via EnvChange tokens
 - ✅ **Database context** - Signals database name via EnvChange tokens
@@ -21,7 +22,8 @@ This crate provides a lightweight mock server that implements enough of the TDS 
 - ✅ **Result set parsing** - Correctly formats ColMetadata and Row tokens
 - ✅ **Multiple queries** - Can handle multiple sequential queries on same connection
 - ✅ **Connection reuse** - Supports multiple connections sequentially
-- ❌ **String data types** - VARCHAR, NVARCHAR not yet supported
+- ✅ **NVARCHAR data** - Supports Unicode string columns and rows
+- ✅ **JDBC demo responses** - Returns dummy NTLM authentication-scheme and connection-canary result sets
 
 ## CLI Usage
 
@@ -45,6 +47,11 @@ cargo run -p mssql-mock-tds -- --port 1433 --tls-mode optional \
 
 # Enable verbose logging
 cargo run -p mssql-mock-tds -- --port 1433 -vv
+
+# Windows only: validate domain credentials with the NTLM SSPI package
+cargo run -p mssql-mock-tds -- --host 0.0.0.0 --port 11433 \
+    --tls-mode optional --pfx path/to/identity.pfx \
+    --auth-mode windows-ntlm -vv
 ```
 
 ### CLI Options
@@ -54,6 +61,7 @@ cargo run -p mssql-mock-tds -- --port 1433 -vv
 | `-H, --host` | Host address to bind to | `127.0.0.1` |
 | `-p, --port` | Port to listen on | `1433` |
 | `-m, --tls-mode` | TLS mode: `none`, `optional`, `strict` | `none` |
+| `--auth-mode` | Authentication policy: `accept-all` or `windows-ntlm` | `accept-all` |
 | `-c, --cert` | Path to PEM certificate file | - |
 | `-k, --key` | Path to PEM private key file | - |
 | `--pfx` | Path to PKCS#12 (.pfx) identity file | - |

@@ -24,11 +24,15 @@ pub mod query_response;
 pub mod server;
 pub mod tds_tls_wrapper;
 pub mod tls_helper;
+#[cfg(windows)]
+mod windows_sspi;
 
 pub use query_response::{
     ColumnDefinition, ColumnValue, InfoMessage, LeadingError, QueryRegistry, QueryResponse, Row,
     SqlDataType, TM_BEGIN_DELAY_KEY, TerminalError,
 };
-pub use server::{ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig};
+pub use server::{
+    AuthenticationMode, ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig,
+};
 pub use tds_tls_wrapper::TdsTlsWrapper;
 pub use tls_helper::{create_test_identity, load_identity_from_file};

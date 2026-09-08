@@ -329,6 +329,26 @@ impl QueryRegistry {
             "SELECT CAST(1 AS BIGINT), 2, 3",
             QueryResponse::select_multiple_types(),
         );
+        registry.register(
+            "SELECT CONVERT(varchar(20), CONNECTIONPROPERTY('auth_scheme'))",
+            QueryResponse::new(
+                vec![ColumnDefinition::new("auth_scheme", SqlDataType::NVarChar)],
+                vec![Row::new(vec![ColumnValue::NVarChar("NTLM".to_string())])],
+            ),
+        );
+        registry.register(
+            "SELECT * FROM dbo.ConnectionCanary",
+            QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("CanaryId", SqlDataType::Int),
+                    ColumnDefinition::new("Message", SqlDataType::NVarChar),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::Int(1),
+                    ColumnValue::NVarChar("Mock TDS connection succeeded".to_string()),
+                ])],
+            ),
+        );
 
         registry
     }
@@ -433,5 +453,24 @@ mod tests {
             .expect("registered query response should be available");
         assert_eq!(resp.columns.len(), 1);
         assert_eq!(resp.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_jdbc_demo_queries_are_registered_by_default() {
+        let registry = QueryRegistry::new();
+
+        let auth = registry
+            .get("SELECT CONVERT(varchar(20), CONNECTIONPROPERTY('auth_scheme'))")
+            .expect("the JDBC authentication-scheme query should be registered");
+        assert!(matches!(
+            auth.rows[0].values[0],
+            ColumnValue::NVarChar(ref value) if value == "NTLM"
+        ));
+
+        let canary = registry
+            .get("SELECT * FROM dbo.ConnectionCanary")
+            .expect("the JDBC canary query should be registered");
+        assert_eq!(canary.columns.len(), 2);
+        assert_eq!(canary.rows.len(), 1);
     }
 }
